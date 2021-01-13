@@ -255,6 +255,13 @@ static void GetHostName(string* hostname) {
 #endif
 }
 
+static bool IsSymbolLink(string& filepath)
+{
+  char buffer[32] = {0};
+  
+  return readlink(filepath.c_str(), buffer, sizeof(buffer)) < 0 ? false : true;
+}
+
 // Returns true iff terminal supports using colors in output.
 static bool TerminalSupportsColor() {
   bool term_supports_color = false;
@@ -426,6 +433,7 @@ class LogFileObject : public base::Logger {
   void SetBasename(const char* basename);
   void SetExtension(const char* ext);
   void SetSymlinkBasename(const char* symlink_basename);
+  void SetTimestamp(const string timestamp);
 
   // Normal flushing routine
   virtual void Flush();
@@ -450,6 +458,7 @@ class LogFileObject : public base::Logger {
   string base_filename_;
   string symlink_basename_;
   string filename_extension_;     // option users can specify (eg to add port#)
+  string timestamp_filename_;
   FILE* file_;
   LogSeverity severity_;
   uint32 bytes_since_flush_;
@@ -473,13 +482,14 @@ class LogCleaner {
 
   void Enable(int overdue_days);
   void Disable();
-  void Run(bool base_filename_selected, const string& base_filename) const;
+  void Run(bool base_filename_selected, const string& base_filename, const string& timestamp_filename_) const;
 
   inline bool enabled() const { return enabled_; }
 
  private:
   vector<string> GetOverdueLogNames(string log_directory, int days,
-                                    const string& base_filename) const;
+                                    const string& base_filename,
+                                    const string& timestamp_filename) const;
   bool IsLogFromCurrentProject(const string& filepath, const string& base_filename) const;
   bool IsLogLastModifiedOver(const string& filepath, int days) const;
  
@@ -972,6 +982,10 @@ void LogFileObject::SetSymlinkBasename(const char* symlink_basename) {
   symlink_basename_ = symlink_basename;
 }
 
+void LogFileObject::SetTimestamp(const string timestamp) {
+  timestamp_filename_ = timestamp.substr(0, timestamp.rfind("."));
+}
+
 void LogFileObject::Flush() {
   MutexLock l(&lock_);
   FlushUnlocked();
@@ -1001,7 +1015,10 @@ bool LogFileObject::CreateLogfile(const string& time_pid_string) {
     flags = flags | O_EXCL;
   }
   int fd = open(filename, flags, FLAGS_logfile_mode);
-  if (fd == -1) return false;
+  if (fd == -1)
+    return false;
+  else
+    SetTimestamp(time_pid_string);
 #ifdef HAVE_FCNTL
   // Mark the file close-on-exec. We don't really care if this fails
   fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -1277,7 +1294,7 @@ void LogFileObject::Write(bool force_flush,
       if (base_filename_selected_ && base_filename_.empty()) {
         return;
       }
-      log_cleaner.Run(base_filename_selected_, base_filename_);
+      log_cleaner.Run(base_filename_selected_, base_filename_, timestamp_filename_);
     }
   }
 }
@@ -1302,7 +1319,8 @@ void LogCleaner::Disable() {
   enabled_ = false;
 }
 
-void LogCleaner::Run(bool base_filename_selected, const string& base_filename) const {
+void LogCleaner::Run(bool base_filename_selected, const string& base_filename,
+                     const string& timestamp_filename) const {
   assert(enabled_ && overdue_days_ > 0);
 
   vector<string> dirs;
@@ -1315,7 +1333,7 @@ void LogCleaner::Run(bool base_filename_selected, const string& base_filename) c
   }
 
   for (size_t i = 0; i < dirs.size(); i++) {
-    vector<string> logs = GetOverdueLogNames(dirs[i], overdue_days_, base_filename);
+    vector<string> logs = GetOverdueLogNames(dirs[i], overdue_days_, base_filename, timestamp_filename);
     for (size_t j = 0; j < logs.size(); j++) {
       static_cast<void>(unlink(logs[j].c_str()));
     }
@@ -1323,13 +1341,19 @@ void LogCleaner::Run(bool base_filename_selected, const string& base_filename) c
 }
 
 vector<string> LogCleaner::GetOverdueLogNames(string log_directory, int days,
-                                              const string& base_filename) const {
+                                              const string& base_filename,
+                                              const string& timestamp_filename) const {
   // The names of overdue logs.
   vector<string> overdue_log_names;
 
   // Try to get all files within log_directory.
   DIR *dir;
   struct dirent *ent;
+
+  static off_t max_size = FLAGS_max_log_size * 10 * 1024 * 1024; // 10 times of FLAGS_max_log_size
+  off_t size = 0;
+
+  char buf[32] = {0};
 
   // If log_directory doesn't end with a slash, append a slash to it.
   if (log_directory.at(log_directory.size() - 1) != dir_delim_) {
@@ -1345,10 +1369,25 @@ vector<string> LogCleaner::GetOverdueLogNames(string log_directory, int days,
       if (IsLogFromCurrentProject(filepath, base_filename) &&
           IsLogLastModifiedOver(filepath, days)) {
         overdue_log_names.push_back(filepath);
+      } else {
+        struct stat file_stat = {0};
+
+        if (IsSymbolLink(filepath))
+          continue;
+
+        if (stat(filepath.c_str(), &file_stat) == 0) {
+          size = size + file_stat.st_size;
+
+          if (strstr(filepath.c_str(), timestamp_filename.c_str()) == NULL)
+            overdue_log_names.push_back(filepath);
+        }
       }
     }
     closedir(dir);
   }
+
+  if (size < max_size) 
+    overdue_log_names.clear();
 
   return overdue_log_names;
 }
